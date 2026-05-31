@@ -1484,6 +1484,26 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			wsFirstMessage = h.gatewayService.ReplaceModelInBody(firstMessage, channelMappingWS.MappedModel)
 		}
 
+		// Codex image generation bridge：向 WS 首条消息注入 image_generation 工具和桥接指令
+		injected, bridgeApplied := h.gatewayService.ApplyCodexImageGenerationBridgeToWSPayload(
+			ctx,
+			userAgent,
+			c.GetHeader("originator"),
+			wsFirstMessage,
+			account,
+			apiKey,
+		)
+		reqLog.Info("openai.imagegen_bridge_check", zap.Bool("bridge_applied", bridgeApplied), zap.Int("payload_bytes", len(wsFirstMessage)))
+		if bridgeApplied && h.gatewayService.WSPayloadHasInput(wsFirstMessage) {
+			wsFirstMessage = injected
+			// chatgpt.com WS 后端会剥离外部注入的工具，改走 HTTP POST 路径（等同 CRS 的方案）。
+			if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, wsFirstMessage); err != nil {
+				reqLog.Warn("openai.imagegen_http_fallback_failed", zap.Error(err))
+				closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "image generation upstream failed")
+			}
+			return
+		}
+
 		if err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks); err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {

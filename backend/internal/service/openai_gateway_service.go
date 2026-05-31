@@ -33,6 +33,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	coderws "github.com/coder/websocket"
 	"go.uber.org/zap"
 )
 
@@ -472,6 +473,164 @@ func (s *OpenAIGatewayService) isCodexImageGenerationBridgeEnabled(ctx context.C
 		}
 	}
 	return s != nil && s.cfg != nil && s.cfg.Gateway.CodexImageGenerationBridgeEnabled
+}
+
+// ProxyImageGenViaHTTP handles a Codex WS session's image generation turn by routing
+// the request through HTTP POST to the chatgpt.com Responses endpoint (which supports
+// externally-injected image_generation tools), and relays the SSE response back to the
+// WS client as individual WS text messages.
+func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
+	ctx context.Context,
+	c *gin.Context,
+	wsConn *coderws.Conn,
+	account *Account,
+	token string,
+	wsPayload []byte,
+) error {
+	// Build a minimal clean HTTP body from the WS payload.
+	// We extract only model + input, then add the required HTTP-only fields.
+	// This avoids stripping every WS-specific field one by one.
+	var wsBody map[string]any
+	if err := json.Unmarshal(wsPayload, &wsBody); err != nil {
+		return fmt.Errorf("parse ws payload: %w", err)
+	}
+	keys := make([]string, 0, len(wsBody))
+	for k := range wsBody {
+		keys = append(keys, k)
+	}
+	inputVal := wsBody["input"]
+	var inputLen int
+	if inputVal != nil {
+		if arr, ok := inputVal.([]any); ok {
+			inputLen = len(arr)
+		}
+	}
+	logger.LegacyPrintf("service.openai_gateway", "[debug] ProxyImageGenViaHTTP ws_bytes=%d wsBody_keys=%v input_type=%T input_len=%d", len(wsPayload), keys, inputVal, inputLen)
+	body := map[string]any{
+		"model":        wsBody["model"],
+		"input":        wsBody["input"],
+		"store":        false,
+		"stream":       true,
+		"instructions": codexImageGenerationBridgeText,
+		"tools":        []any{map[string]any{"type": "image_generation", "output_format": "png"}},
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal http body: %w", err)
+	}
+
+	// Build request directly — buildUpstreamRequest is designed for the HTTP handler path
+	// and may misbehave with a WS gin.Context. We construct the request manually.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatgptCodexURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("build http request: %w", err)
+	}
+	req.Host = "chatgpt.com"
+	req.Header.Set("authorization", "Bearer "+token)
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("accept", "text/event-stream")
+	if chatgptAccountID := account.GetChatGPTAccountID(); chatgptAccountID != "" {
+		req.Header.Set("chatgpt-account-id", chatgptAccountID)
+	}
+	if account.Proxy != nil {
+		// Proxy support left to future work; skip for now.
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: account has proxy configured but proxy is not applied in this path")
+	}
+
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: sending HTTP POST to chatgpt.com body_bytes=%d", len(bodyBytes))
+
+	httpClient := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http upstream: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(rb))
+	}
+
+	// Relay SSE events to WS client.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 32<<20), 32<<20) // 32MB for partial_image base64 data
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		werr := wsConn.Write(writeCtx, coderws.MessageText, []byte(data))
+		cancel()
+		if werr != nil {
+			return nil // client disconnected
+		}
+	}
+	return scanner.Err()
+}
+
+// WSPayloadHasInput returns true when the WS payload appears to contain a real user request
+// (not a prewarm or empty reconnect message). We check both the input array and the payload
+// size: a genuine first turn is always large enough to carry the conversation context.
+func (s *OpenAIGatewayService) WSPayloadHasInput(payload []byte) bool {
+	// Check input array is non-empty.
+	result := gjson.GetBytes(payload, "input")
+	inputNonEmpty := result.Exists() && result.Type != gjson.Null && len(result.Raw) > 2
+	// Also accept large payloads (≥8KB) that carry conversation context even if input key
+	// is structured differently (e.g. nested under a wrapper object).
+	hasInput := inputNonEmpty || len(payload) >= 8192
+	logger.LegacyPrintf("service.openai_gateway", "[debug] WSPayloadHasInput bytes=%d input_raw_len=%d input_non_empty=%v has_input=%v", len(payload), len(result.Raw), inputNonEmpty, hasInput)
+	return hasInput
+}
+
+// ApplyCodexImageGenerationBridgeToWSPayload injects the image_generation tool and bridge
+// instructions into a WebSocket first-message payload when the bridge is enabled for the
+// given account/apiKey combination and the request originates from an official Codex client.
+// Returns the (possibly modified) payload and whether any modification was made.
+func (s *OpenAIGatewayService) ApplyCodexImageGenerationBridgeToWSPayload(
+	ctx context.Context,
+	userAgent, originator string,
+	payload []byte,
+	account *Account,
+	apiKey *APIKey,
+) ([]byte, bool) {
+	if !openai.IsCodexOfficialClientByHeaders(userAgent, originator) {
+		return payload, false
+	}
+	if !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
+		return payload, false
+	}
+	if !s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey) {
+		return payload, false
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return payload, false
+	}
+	modified := false
+	if ensureOpenAIResponsesImageGenerationTool(body) {
+		modified = true
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected /responses image_generation tool for Codex WS client")
+	}
+	if applyCodexImageGenerationBridgeInstructionsForWS(body) {
+		modified = true
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Replaced instructions with image_generation bridge for WS client")
+	}
+	if !modified {
+		return payload, false
+	}
+	out, err := json.Marshal(body)
+	if err != nil {
+		return payload, false
+	}
+	_, hasTools := body["tools"]
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] WS bridge applied: has_tools=%v payload_bytes=%d", hasTools, len(out))
+	return out, true
 }
 
 func (s *OpenAIGatewayService) checkChannelPricingRestriction(ctx context.Context, groupID *int64, requestedModel string) bool {
@@ -4150,6 +4309,11 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	case AccountTypeOAuth:
 		// OAuth accounts use ChatGPT internal API
 		targetURL = chatgptCodexURL
+		snippet := body
+		if len(snippet) > 500 {
+			snippet = snippet[:500]
+		}
+		logger.LegacyPrintf("service.openai_gateway", "[debug] OAuth HTTP POST body_bytes=%d body_prefix=%s", len(body), string(snippet))
 	case AccountTypeAPIKey:
 		// API Key accounts use Platform API or custom base URL
 		baseURL := account.GetOpenAIBaseURL()
