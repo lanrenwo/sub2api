@@ -1494,13 +1494,19 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			apiKey,
 		)
 		reqLog.Info("openai.imagegen_bridge_check", zap.Bool("bridge_applied", bridgeApplied), zap.Int("payload_bytes", len(wsFirstMessage)))
+		httpBridgeUsed := false
 		if bridgeApplied && h.gatewayService.WSPayloadHasInput(wsFirstMessage) {
 			wsFirstMessage = injected
 			// chatgpt.com WS 后端会剥离外部注入的工具，改走 HTTP POST 路径（等同 CRS 的方案）。
 			if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, wsFirstMessage); err != nil {
 				reqLog.Warn("openai.imagegen_http_fallback_failed", zap.Error(err))
-				closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "image generation upstream failed")
+				// bridge 失败时不关闭 WS，直接 fall-through 到正常 WS 路径，
+				// 避免触发 Codex 客户端重连。
+			} else {
+				httpBridgeUsed = true
 			}
+		}
+		if httpBridgeUsed {
 			return
 		}
 

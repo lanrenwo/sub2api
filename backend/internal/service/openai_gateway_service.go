@@ -487,33 +487,63 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	token string,
 	wsPayload []byte,
 ) error {
-	// Build a minimal clean HTTP body from the WS payload.
-	// We extract only model + input, then add the required HTTP-only fields.
-	// This avoids stripping every WS-specific field one by one.
+	// Convert WS first-message payload to a chatgpt.com HTTP Responses body.
+	// Strategy mirrors CRS: whitelist only fields chatgpt.com HTTP accepts,
+	// then apply OAuth transform + inject image_generation tool and bridge instructions.
 	var wsBody map[string]any
 	if err := json.Unmarshal(wsPayload, &wsBody); err != nil {
 		return fmt.Errorf("parse ws payload: %w", err)
 	}
-	keys := make([]string, 0, len(wsBody))
-	for k := range wsBody {
-		keys = append(keys, k)
+
+	// Whitelist: keep only fields the chatgpt.com HTTP endpoint supports.
+	// WS-specific fields (type, generate, client_metadata, etc.) are excluded.
+	httpAllowed := map[string]bool{
+		"model": true, "input": true, "instructions": true, "tools": true,
+		"store": true, "stream": true, "tool_choice": true, "reasoning": true,
+		"prompt_cache_key": true, "previous_response_id": true,
+		"parallel_tool_calls": true, "temperature": true, "top_p": true,
+		"max_output_tokens": true, "truncation": true, "include": true,
 	}
-	inputVal := wsBody["input"]
-	var inputLen int
-	if inputVal != nil {
-		if arr, ok := inputVal.([]any); ok {
-			inputLen = len(arr)
+	body := map[string]any{}
+	for k, v := range wsBody {
+		if httpAllowed[k] {
+			body[k] = v
 		}
 	}
-	logger.LegacyPrintf("service.openai_gateway", "[debug] ProxyImageGenViaHTTP ws_bytes=%d wsBody_keys=%v input_type=%T input_len=%d", len(wsPayload), keys, inputVal, inputLen)
-	body := map[string]any{
-		"model":        wsBody["model"],
-		"input":        wsBody["input"],
-		"store":        false,
-		"stream":       true,
-		"instructions": codexImageGenerationBridgeText,
-		"tools":        []any{map[string]any{"type": "image_generation", "output_format": "png"}},
+
+	// Apply OAuth transform: store=false, stream=true, strip unsupported fields,
+	// convert input format, extract system messages, etc.
+	applyCodexOAuthTransform(body, true, false)
+
+	// Debug: log raw input field from WS payload.
+	rawInput := gjson.GetBytes(wsPayload, "input").Raw
+	if len(rawInput) > 300 {
+		rawInput = rawInput[:300]
 	}
+	logger.LegacyPrintf("service.openai_gateway", "[debug] ProxyImageGenViaHTTP input_raw=%s", rawInput)
+
+	// If input ended up empty after the transform, fall back to extracting the
+	// first user message directly from the raw WS payload.
+	inputArr, _ := body["input"].([]any)
+	if len(inputArr) == 0 {
+		// Try various gjson paths for user content.
+		for _, path := range []string{
+			`input.#(role=="user").content`,
+			`input.0.content`,
+			`response.input.#(role=="user").content`,
+			`messages.#(role=="user").content`,
+		} {
+			if v := gjson.GetBytes(wsPayload, path).String(); v != "" {
+				body["input"] = []any{map[string]any{"type": "message", "role": "user", "content": v}}
+				break
+			}
+		}
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: input empty after transform, input_after_fallback=%v", body["input"] != nil)
+	}
+
+	// Inject image_generation tool (CRS-equivalent) and replace instructions.
+	ensureOpenAIResponsesImageGenerationTool(body)
+	applyCodexImageGenerationBridgeInstructionsForWS(body)
 
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
@@ -555,8 +585,12 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	// Relay SSE events to WS client.
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 32<<20), 32<<20) // 32MB for partial_image base64 data
+	completed := false
 	for scanner.Scan() {
 		line := scanner.Text()
+		if strings.HasPrefix(line, "event: response.completed") {
+			completed = true
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -571,7 +605,12 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 			return nil // client disconnected
 		}
 	}
-	return scanner.Err()
+	// chatgpt.com SSE streams typically end with an abrupt close rather than [DONE].
+	// Treat EOF after response.completed as success.
+	if scanErr := scanner.Err(); scanErr != nil && !completed {
+		return scanErr
+	}
+	return nil
 }
 
 // WSPayloadHasInput returns true when the WS payload appears to contain a real user request
