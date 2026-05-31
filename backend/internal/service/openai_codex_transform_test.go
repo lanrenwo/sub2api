@@ -639,6 +639,24 @@ func TestApplyCodexImageGenerationBridgeInstructions_AppendsBridgeOnce(t *testin
 	require.False(t, modified)
 }
 
+func TestApplyCodexImageGenerationBridgeInstructions_PreservesWSInstructions(t *testing.T) {
+	reqBody := map[string]any{
+		"model":        "gpt-5.4",
+		"instructions": "Codex system instructions and user context",
+		"tools": []any{
+			map[string]any{"type": "image_generation", "output_format": "png"},
+		},
+	}
+
+	modified := applyCodexImageGenerationBridgeInstructions(reqBody)
+
+	require.True(t, modified)
+	instructions, ok := reqBody["instructions"].(string)
+	require.True(t, ok)
+	require.Contains(t, instructions, "Codex system instructions and user context")
+	require.Contains(t, instructions, codexImageGenerationBridgeMarker)
+}
+
 func TestApplyCodexImageGenerationBridgeInstructions_SkipsSpark(t *testing.T) {
 	reqBody := map[string]any{
 		"model":        "gpt-5.3-codex-spark",

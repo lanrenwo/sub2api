@@ -29,11 +29,11 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/cespare/xxhash/v2"
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	coderws "github.com/coder/websocket"
 	"go.uber.org/zap"
 )
 
@@ -487,63 +487,36 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	token string,
 	wsPayload []byte,
 ) error {
-	// Convert WS first-message payload to a chatgpt.com HTTP Responses body.
-	// Strategy mirrors CRS: whitelist only fields chatgpt.com HTTP accepts,
-	// then apply OAuth transform + inject image_generation tool and bridge instructions.
+	// Build HTTP body from the original (pre-injection) WS payload. This path is
+	// only used after WSPayloadHasInput confirms a user-authored message exists.
 	var wsBody map[string]any
 	if err := json.Unmarshal(wsPayload, &wsBody); err != nil {
 		return fmt.Errorf("parse ws payload: %w", err)
 	}
 
-	// Whitelist: keep only fields the chatgpt.com HTTP endpoint supports.
-	// WS-specific fields (type, generate, client_metadata, etc.) are excluded.
-	httpAllowed := map[string]bool{
-		"model": true, "input": true, "instructions": true, "tools": true,
-		"store": true, "stream": true, "tool_choice": true, "reasoning": true,
-		"prompt_cache_key": true, "previous_response_id": true,
-		"parallel_tool_calls": true, "temperature": true, "top_p": true,
-		"max_output_tokens": true, "truncation": true, "include": true,
-	}
-	body := map[string]any{}
-	for k, v := range wsBody {
-		if httpAllowed[k] {
-			body[k] = v
-		}
+	model, _ := wsBody["model"].(string)
+	originalInstructions, _ := wsBody["instructions"].(string)
+	originalInput, _ := wsBody["input"].([]any)
+	if len(originalInput) == 0 {
+		return errors.New("missing user input for image generation bridge")
 	}
 
-	// Apply OAuth transform: store=false, stream=true, strip unsupported fields,
-	// convert input format, extract system messages, etc.
-	applyCodexOAuthTransform(body, true, false)
+	// Use only bridge text as instructions — the full Codex system prompt (~13KB) would
+	// dominate and cause the model to generate images from the coding-assistant context
+	// rather than from the user's actual request in input. CRS does the same: replaces
+	// instructions with a focused prompt (CODEX_CLI_INSTRUCTIONS) before forwarding.
+	combinedInstructions := codexImageGenerationBridgeText
 
-	// Debug: log raw input field from WS payload.
-	rawInput := gjson.GetBytes(wsPayload, "input").Raw
-	if len(rawInput) > 300 {
-		rawInput = rawInput[:300]
-	}
-	logger.LegacyPrintf("service.openai_gateway", "[debug] ProxyImageGenViaHTTP input_raw=%s", rawInput)
-
-	// If input ended up empty after the transform, fall back to extracting the
-	// first user message directly from the raw WS payload.
-	inputArr, _ := body["input"].([]any)
-	if len(inputArr) == 0 {
-		// Try various gjson paths for user content.
-		for _, path := range []string{
-			`input.#(role=="user").content`,
-			`input.0.content`,
-			`response.input.#(role=="user").content`,
-			`messages.#(role=="user").content`,
-		} {
-			if v := gjson.GetBytes(wsPayload, path).String(); v != "" {
-				body["input"] = []any{map[string]any{"type": "message", "role": "user", "content": v}}
-				break
-			}
-		}
-		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: input empty after transform, input_after_fallback=%v", body["input"] != nil)
+	body := map[string]any{
+		"model":        model,
+		"input":        originalInput,
+		"instructions": combinedInstructions,
+		"tools":        []any{map[string]any{"type": "image_generation", "output_format": "png"}},
+		"store":        false,
+		"stream":       true,
 	}
 
-	// Inject image_generation tool (CRS-equivalent) and replace instructions.
-	ensureOpenAIResponsesImageGenerationTool(body)
-	applyCodexImageGenerationBridgeInstructionsForWS(body)
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: original_instr_len=%d input_items=%d combined_instr_len=%d", len(originalInstructions), len(originalInput), len(combinedInstructions))
 
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
@@ -613,18 +586,27 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	return nil
 }
 
-// WSPayloadHasInput returns true when the WS payload appears to contain a real user request
-// (not a prewarm or empty reconnect message). We check both the input array and the payload
-// size: a genuine first turn is always large enough to carry the conversation context.
+// WSPayloadHasInput returns true when the WS payload contains a user-authored
+// input message. Tool-only turns are not user prompts and must not trigger the
+// HTTP image bridge fallback.
 func (s *OpenAIGatewayService) WSPayloadHasInput(payload []byte) bool {
-	// Check input array is non-empty.
-	result := gjson.GetBytes(payload, "input")
-	inputNonEmpty := result.Exists() && result.Type != gjson.Null && len(result.Raw) > 2
-	// Also accept large payloads (≥8KB) that carry conversation context even if input key
-	// is structured differently (e.g. nested under a wrapper object).
-	hasInput := inputNonEmpty || len(payload) >= 8192
-	logger.LegacyPrintf("service.openai_gateway", "[debug] WSPayloadHasInput bytes=%d input_raw_len=%d input_non_empty=%v has_input=%v", len(payload), len(result.Raw), inputNonEmpty, hasInput)
-	return hasInput
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return false
+	}
+	hasUserMessage := false
+	for _, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		role := strings.TrimSpace(item.Get("role").String())
+		if role == "user" || itemType == "input_text" {
+			hasUserMessage = true
+			continue
+		}
+		if itemType == "message" && (role == "" || role == "user") {
+			hasUserMessage = true
+		}
+	}
+	return hasUserMessage
 }
 
 // ApplyCodexImageGenerationBridgeToWSPayload injects the image_generation tool and bridge
@@ -656,9 +638,9 @@ func (s *OpenAIGatewayService) ApplyCodexImageGenerationBridgeToWSPayload(
 		modified = true
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected /responses image_generation tool for Codex WS client")
 	}
-	if applyCodexImageGenerationBridgeInstructionsForWS(body) {
+	if applyCodexImageGenerationBridgeInstructions(body) {
 		modified = true
-		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Replaced instructions with image_generation bridge for WS client")
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Added image_generation bridge instructions for Codex WS client")
 	}
 	if !modified {
 		return payload, false

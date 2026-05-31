@@ -268,6 +268,45 @@ func TestOpenAIGatewayService_CodexImageGenerationBridgeOverridePrecedence(t *te
 	}
 }
 
+func TestOpenAIGatewayServiceWSPayloadHasInput_UserMessagesOnly(t *testing.T) {
+	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
+
+	require.False(t, svc.WSPayloadHasInput([]byte(`{"input":[]}`)))
+	require.False(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"function_call_output","call_id":"call_1","output":"missing OPENAI_API_KEY"}]}`)))
+	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"message","role":"user","content":"continue"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)))
+	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"},{"type":"message","role":"user","content":"continue"}]}`)))
+	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"message","role":"user","content":"生成一张奶茶宣传海报"}]}`)))
+	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"role":"user","content":[{"type":"input_text","text":"draw a poster"}]}]}`)))
+}
+
+func TestOpenAIGatewayServiceApplyCodexImageGenerationBridgeToWSPayload_PreservesInstructions(t *testing.T) {
+	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
+	svc.cfg.Gateway.CodexImageGenerationBridgeEnabled = true
+	_, _ = newOpenAIImageGenerationControlTestContext(true, "codex_cli_rs/0.98.0")
+	groupID := int64(4242)
+	apiKey := &APIKey{
+		GroupID: &groupID,
+		Group:   &Group{ID: groupID, AllowImageGeneration: true},
+	}
+	account := newOpenAIImageGenerationControlTestAccount()
+	payload := []byte(`{"model":"gpt-5.5","instructions":"original codex instructions","input":[]}`)
+
+	injected, modified := svc.ApplyCodexImageGenerationBridgeToWSPayload(
+		context.Background(),
+		"codex_cli_rs/0.98.0",
+		"",
+		payload,
+		account,
+		apiKey,
+	)
+
+	require.True(t, modified)
+	require.True(t, gjson.GetBytes(injected, `tools.#(type=="image_generation")`).Exists())
+	instructions := gjson.GetBytes(injected, "instructions").String()
+	require.Contains(t, instructions, "original codex instructions")
+	require.Contains(t, instructions, codexImageGenerationBridgeMarker)
+}
+
 func TestOpenAIGatewayServiceHandleResponsesImageOutputs_NonStreaming(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
