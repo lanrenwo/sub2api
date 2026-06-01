@@ -310,8 +310,14 @@ func TestOpenAIGatewayServiceIsCodexWSImageIntent(t *testing.T) {
 		{"tool-only turn", `{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`, false},
 		{"empty input", `{"input":[]}`, false},
 
-		// --- scope: only the latest user message decides ---
+		// --- scope: only the latest user message decides (no follow-up cue) ---
 		{"history image then code turn", `{"input":[{"type":"message","role":"user","content":"生成一张海报"},{"type":"function_call_output","call_id":"c1","output":"done"},{"type":"message","role":"user","content":"现在帮我重构这个函数"}]}`, false},
+
+		// --- contextual follow-up: continuation cue + earlier image intent in same payload ---
+		{"zh another poster after poster", `{"input":[{"type":"message","role":"user","content":"生成一张内蒙古的美食海报，顺便把食品名字，也要显示。"},{"type":"message","role":"assistant","content":"已生成内蒙古美食海报"},{"type":"message","role":"user","content":"不错，再来一张 湖北的。"}]}`, true},
+		{"en another after image", `{"input":[{"role":"user","content":[{"type":"input_text","text":"generate an image of a cat"}]},{"type":"message","role":"assistant","content":"done"},{"role":"user","content":[{"type":"input_text","text":"nice, another one please"}]}]}`, true},
+		{"zh followup cue without prior image", `{"input":[{"type":"message","role":"user","content":"不错，再来一张"}]}`, false},
+		{"zh coding turn after prior image", `{"input":[{"type":"message","role":"user","content":"生成一张海报"},{"type":"message","role":"assistant","content":"done"},{"type":"message","role":"user","content":"帮我写段 Go 代码"}]}`, false},
 	}
 
 	for _, tt := range tests {

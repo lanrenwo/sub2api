@@ -728,35 +728,58 @@ var (
 	zhImageEditPhrase = []string{"抠图", "改图", "修图", "重绘", "p图", "P图", "去水印", "加水印", "扩图"}
 	// 跟在“图”后面表示这是“图表/图标”等非图片语义的字符，需排除以避免误触发。
 	zhBareImageExcludeNext = map[rune]struct{}{'表': {}, '标': {}, '例': {}, '层': {}, '谱': {}, '文': {}}
+	// 续作线索：省略式追问（“再来一张/another”），需结合同 payload 更早的生图意图才放行。
+	zhImageFollowupCues = []string{"再来一张", "再来一个", "再来个", "再来张", "再生成", "再画", "再做一张", "再做个", "再搞一张", "再出一张", "再整一张", "换一张", "换张"}
+	reEnImageFollowup   = regexp.MustCompile(`\b(another( one)?|one more|do another|make another)\b`)
 )
 
-// codexWSImageIntent reports whether the WS payload's latest user message expresses
-// an image generation or editing intent.
+// codexWSImageIntent reports whether the WS payload expresses an image generation or
+// editing intent. It judges the latest user message directly; for elliptical follow-ups
+// ("再来一张" / "another one") that carry no image noun of their own, it also accepts the
+// turn when a continuation cue co-occurs with an earlier image-intent user message in the
+// same (full-replay) payload.
 func codexWSImageIntent(payload []byte) bool {
 	input := gjson.GetBytes(payload, "input")
 	if !input.Exists() || !input.IsArray() {
 		return false
 	}
-	var lastUser gjson.Result
-	found := false
+	var userItems []gjson.Result
 	for _, item := range input.Array() {
 		itemType := strings.TrimSpace(item.Get("type").String())
 		role := strings.TrimSpace(item.Get("role").String())
 		isUser := role == "user" || itemType == "input_text" ||
 			(itemType == "message" && (role == "" || role == "user"))
 		if isUser {
-			lastUser = item
-			found = true
+			userItems = append(userItems, item)
 		}
 	}
-	if !found {
+	if len(userItems) == 0 {
 		return false
 	}
-	text, hasInputImage := codexWSUserMessageContent(lastUser)
-	if hasInputImage {
+
+	lastText, hasInputImage := codexWSUserMessageContent(userItems[len(userItems)-1])
+	if hasInputImage || matchImageIntentText(lastText) {
 		return true
 	}
-	return matchImageIntentText(text)
+	if !hasImageFollowupCue(lastText) {
+		return false
+	}
+	// Continuation cue present: only honor it when an earlier user turn in this payload
+	// actually asked for an image, so a bare "再来一张" in a coding session won't trigger.
+	for _, item := range userItems[:len(userItems)-1] {
+		text, hasImg := codexWSUserMessageContent(item)
+		if hasImg || matchImageIntentText(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasImageFollowupCue(text string) bool {
+	if zhHasAny(text, zhImageFollowupCues) {
+		return true
+	}
+	return reEnImageFollowup.MatchString(strings.ToLower(text))
 }
 
 // codexWSUserMessageContent extracts the textual content of a user input item and
