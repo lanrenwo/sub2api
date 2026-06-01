@@ -3,7 +3,10 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 var codexModelMap = map[string]string{
@@ -704,6 +707,135 @@ func ensureOpenAIResponsesImageGenerationTool(reqBody map[string]any) bool {
 
 	reqBody["tools"] = append(tools, tool)
 	return true
+}
+
+// --- Codex WS image-generation intent detection ---------------------------------
+//
+// The WS bridge force-injects an image_generation tool into every qualifying Codex
+// session, so it must NOT route every user turn through the HTTP image path. This
+// detector decides whether a given turn actually expresses an image generation/edit
+// intent. It scans only the LATEST user message (per-turn semantics, so an earlier
+// image request can't pollute a later coding turn) and requires a generation verb to
+// co-occur with a strong pictorial noun — bare nouns that are common in coding talk
+// (image/render/background/logo/icon) do NOT trigger on their own.
+
+var (
+	reEnImageGenVerb  = regexp.MustCompile(`\b(generate|create|make|draw|paint|render|produce|sketch|design)\b`)
+	reEnImageNoun     = regexp.MustCompile(`\b(image|images|picture|pictures|poster|posters|photo|photos|photograph|photographs|illustration|illustrations|wallpaper|wallpapers|artwork|drawing|drawings|painting|paintings|avatar|avatars|comic|comics)\b`)
+	reEnImagePhrase   = regexp.MustCompile(`\b(an image of|edit(ed|s|ing)?\s+(the\s+|this\s+|that\s+|my\s+|an?\s+)?(image|photo|picture|illustration))\b`)
+	zhImageGenVerbs   = []string{"生成", "画", "绘制", "绘", "做", "制作", "来张", "整张", "生图", "出图"}
+	zhImageNouns      = []string{"图片", "图像", "海报", "头像", "插画", "壁纸", "封面", "漫画", "配图", "照片", "表情包", "立绘"}
+	zhImageEditPhrase = []string{"抠图", "改图", "修图", "重绘", "p图", "P图", "去水印", "加水印", "扩图"}
+	// 跟在“图”后面表示这是“图表/图标”等非图片语义的字符，需排除以避免误触发。
+	zhBareImageExcludeNext = map[rune]struct{}{'表': {}, '标': {}, '例': {}, '层': {}, '谱': {}, '文': {}}
+)
+
+// codexWSImageIntent reports whether the WS payload's latest user message expresses
+// an image generation or editing intent.
+func codexWSImageIntent(payload []byte) bool {
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return false
+	}
+	var lastUser gjson.Result
+	found := false
+	for _, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		role := strings.TrimSpace(item.Get("role").String())
+		isUser := role == "user" || itemType == "input_text" ||
+			(itemType == "message" && (role == "" || role == "user"))
+		if isUser {
+			lastUser = item
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	text, hasInputImage := codexWSUserMessageContent(lastUser)
+	if hasInputImage {
+		return true
+	}
+	return matchImageIntentText(text)
+}
+
+// codexWSUserMessageContent extracts the textual content of a user input item and
+// reports whether it carries an input_image block (image-editing structural signal).
+func codexWSUserMessageContent(item gjson.Result) (string, bool) {
+	var sb strings.Builder
+	hasImage := false
+	if strings.TrimSpace(item.Get("type").String()) == "input_text" {
+		sb.WriteString(item.Get("text").String())
+	}
+	content := item.Get("content")
+	switch {
+	case content.Type == gjson.String:
+		sb.WriteString(" ")
+		sb.WriteString(content.String())
+	case content.IsArray():
+		for _, block := range content.Array() {
+			blockType := strings.TrimSpace(block.Get("type").String())
+			if blockType == "input_image" || block.Get("image_url").Exists() {
+				hasImage = true
+			}
+			sb.WriteString(" ")
+			sb.WriteString(block.Get("text").String())
+		}
+	}
+	return sb.String(), hasImage
+}
+
+func matchImageIntentText(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if reEnImagePhrase.MatchString(lower) {
+		return true
+	}
+	if reEnImageGenVerb.MatchString(lower) && reEnImageNoun.MatchString(lower) {
+		return true
+	}
+	if zhHasAny(text, zhImageEditPhrase) {
+		return true
+	}
+	if strings.Contains(text, "背景") && zhHasAny(text, []string{"换", "替换", "改", "去", "加", "抠"}) {
+		return true
+	}
+	if zhHasAny(text, zhImageGenVerbs) && zhHasImageNoun(text) {
+		return true
+	}
+	return false
+}
+
+func zhHasAny(text string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(text, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// zhHasImageNoun matches strong pictorial nouns, plus a bare “图” that is not part of
+// a non-pictorial compound such as 图表/图标/图例/图层/图谱/图文.
+func zhHasImageNoun(text string) bool {
+	if zhHasAny(text, zhImageNouns) {
+		return true
+	}
+	runes := []rune(text)
+	for i, r := range runes {
+		if r != '图' {
+			continue
+		}
+		if i+1 >= len(runes) {
+			return true
+		}
+		if _, excluded := zhBareImageExcludeNext[runes[i+1]]; !excluded {
+			return true
+		}
+	}
+	return false
 }
 
 func applyCodexImageGenerationBridgeInstructions(reqBody map[string]any) bool {

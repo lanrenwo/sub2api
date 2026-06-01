@@ -1404,10 +1404,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, decision.Message, nil)
 				}
 				// Codex 图片生成桥接：chatgpt.com WS 后端会剥离外部注入的 image_generation
-				// server tool，导致模型回退到本地 SVG/HTML 渲染。携带用户消息的 turn（turn 2+）
-				// 改走 HTTP Responses（支持外部注入工具），由上游原生 image_generation 直接生图，
-				// SSE 回放给 WS 客户端后正常关闭连接。
-				if imageBridgeActive && h.gatewayService.WSPayloadHasInput(payload) {
+				// server tool，导致模型回退到本地 SVG/HTML 渲染。仅当这一轮带用户消息且
+				// 该消息确实表达生图/改图意图时，才改走 HTTP Responses（支持外部注入工具），
+				// 由上游原生 image_generation 直接生图，SSE 回放给 WS 客户端后正常关闭连接。
+				// 普通编码 turn 不命中意图门，继续走正常 WS，避免被劫持到 image-gen 路径。
+				if imageBridgeActive && h.gatewayService.WSPayloadHasInput(payload) && h.gatewayService.IsCodexWSImageIntent(payload) {
 					if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, payload); err != nil {
 						reqLog.Warn("openai.imagegen_http_bridge_turn_failed", zap.Int("turn", turn), zap.Error(err))
 						// HTTP 桥失败时回落正常 WS，避免断开触发 Codex 重连。
@@ -1513,9 +1514,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		imageBridgeActive = bridgeApplied
 		if bridgeApplied {
 			wsFirstMessage = injected
-			if h.gatewayService.WSPayloadHasInput(wsFirstMessage) {
-				// chatgpt.com WS 后端会剥离外部注入的 server tool；普通用户 turn 走 HTTP
-				// Responses，让上游模型基于原生 image_generation tool 自行决定是否生图。
+			if h.gatewayService.WSPayloadHasInput(wsFirstMessage) && h.gatewayService.IsCodexWSImageIntent(wsFirstMessage) {
+				// chatgpt.com WS 后端会剥离外部注入的 server tool；仅当首条消息确实表达
+				// 生图/改图意图时才走 HTTP Responses，由上游原生 image_generation 工具生图。
 				if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, wsFirstMessage); err != nil {
 					reqLog.Warn("openai.imagegen_http_bridge_failed", zap.Error(err))
 					// HTTP 桥失败时回落到正常 WS，避免直接断开 Codex 客户端。

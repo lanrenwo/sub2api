@@ -279,6 +279,48 @@ func TestOpenAIGatewayServiceWSPayloadHasInput_UserMessagesOnly(t *testing.T) {
 	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"role":"user","content":[{"type":"input_text","text":"draw a poster"}]}]}`)))
 }
 
+func TestOpenAIGatewayServiceIsCodexWSImageIntent(t *testing.T) {
+	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
+
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		// --- should trigger ---
+		{"zh generate poster", `{"input":[{"type":"message","role":"user","content":"生成一张奶茶宣传海报"}]}`, true},
+		{"zh draw avatar", `{"input":[{"type":"message","role":"user","content":"画个赛博朋克风格头像"}]}`, true},
+		{"zh make cover image", `{"input":[{"type":"message","role":"user","content":"帮我做张封面图"}]}`, true},
+		{"zh draw a generic image", `{"input":[{"type":"message","role":"user","content":"画一张图"}]}`, true},
+		{"zh replace background", `{"input":[{"type":"message","role":"user","content":"把这张图换个背景"}]}`, true},
+		{"en draw a picture", `{"input":[{"role":"user","content":[{"type":"input_text","text":"draw a picture of a cat"}]}]}`, true},
+		{"en generate an image of", `{"input":[{"role":"user","content":[{"type":"input_text","text":"generate an image of a sunset over mountains"}]}]}`, true},
+		{"en edit the photo", `{"input":[{"role":"user","content":[{"type":"input_text","text":"please edit the photo to remove the car"}]}]}`, true},
+		{"input_image edit", `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,xxx"},{"type":"input_text","text":"做成水彩风格"}]}]}`, true},
+
+		// --- should NOT trigger ---
+		{"zh generate chart", `{"input":[{"type":"message","role":"user","content":"生成测试图表数据"}]}`, false},
+		{"zh analyze screenshot", `{"input":[{"type":"message","role":"user","content":"这张图里的代码逻辑怎么改"}]}`, false},
+		{"zh generate icon component", `{"input":[{"type":"message","role":"user","content":"生成一个图标组件"}]}`, false},
+		{"en render component", `{"input":[{"role":"user","content":[{"type":"input_text","text":"render the component again after the change"}]}]}`, false},
+		{"en background color", `{"input":[{"role":"user","content":[{"type":"input_text","text":"change the background color to dark"}]}]}`, false},
+		{"en update logo", `{"input":[{"role":"user","content":[{"type":"input_text","text":"update the logo in the header markup"}]}]}`, false},
+		{"en bare image noun", `{"input":[{"role":"user","content":[{"type":"input_text","text":"the hero image tag is broken, fix it"}]}]}`, false},
+		{"json body analysis", `{"input":[{"type":"message","role":"user","content":"这条 JSON body 里的 | ID: 被 cmd_inject 当成 shell 管道了"}]}`, false},
+		{"tool-only turn", `{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`, false},
+		{"empty input", `{"input":[]}`, false},
+
+		// --- scope: only the latest user message decides ---
+		{"history image then code turn", `{"input":[{"type":"message","role":"user","content":"生成一张海报"},{"type":"function_call_output","call_id":"c1","output":"done"},{"type":"message","role":"user","content":"现在帮我重构这个函数"}]}`, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, svc.IsCodexWSImageIntent([]byte(tt.payload)))
+		})
+	}
+}
+
 func TestOpenAIGatewayServiceApplyCodexImageGenerationBridgeToWSPayload_PreservesInstructions(t *testing.T) {
 	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
 	svc.cfg.Gateway.CodexImageGenerationBridgeEnabled = true

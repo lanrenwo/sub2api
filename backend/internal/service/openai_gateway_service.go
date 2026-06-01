@@ -586,6 +586,13 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	return nil
 }
 
+// IsCodexWSImageIntent reports whether the latest user message in a Codex WS payload
+// expresses an image generation/editing intent. Only turns that pass this gate are
+// routed through the HTTP image bridge; ordinary coding turns stay on WS.
+func (s *OpenAIGatewayService) IsCodexWSImageIntent(payload []byte) bool {
+	return codexWSImageIntent(payload)
+}
+
 // WSPayloadHasInput returns true when the WS payload contains a user-authored
 // input message. Tool-only turns are not user prompts and must not trigger the
 // HTTP image bridge fallback.
