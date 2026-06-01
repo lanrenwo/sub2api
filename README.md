@@ -23,6 +23,15 @@
 - `WSPayloadHasInput`：只识别包含用户消息的 payload，避免把纯工具结果轮次误判为图片生成请求。
 - 测试覆盖：补充了 WS payload 输入识别、Codex WS 桥接注入、图片生成控制等用例。
 
+图片意图识别方式：
+
+| 场景 | 识别方式 | 说明 |
+| --- | --- | --- |
+| 普通 HTTP / Responses 请求 | 结构化字段判断 | 命中图片 endpoint、image model、`tools[].type == "image_generation"` 或 `tool_choice` 选择 `image_generation` 时，判定为图片生成请求 |
+| Codex WS 桥接 | 不做关键词分类 | 网关只判断官方 Codex 客户端、图片权限、桥接开关和当前 turn 是否包含用户消息；是否真正需要生图由上游模型基于用户语义和注入的 `image_generation` 工具决定 |
+| 用户自然语言 | 不扫描关键词 | 不依赖“画一张”“生成海报”“换背景”等文本规则，避免中文/英文/编辑任务/风格迁移等表达漏判或误判 |
+| 工具结果 turn | 明确排除 | `WSPayloadHasInput` 只接受用户消息，避免函数结果、工具输出等非用户输入触发 HTTP 桥接 |
+
 详细技术说明见：[docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md](docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md)。
 
 <div align="center">
