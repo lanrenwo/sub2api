@@ -1,5 +1,21 @@
 # Sub2API
 
+## 当前分支优化：Codex WS 图片生成 HTTP 桥接
+
+当前分支主要解决 Codex 官方客户端通过 WebSocket 访问 OpenAI OAuth 账号时，图片生成请求无法稳定调用原生 `image_generation` 工具的问题。根因是 `chatgpt.com` 的 WebSocket 后端会剥离 sub2api 注入的 `image_generation` server tool，模型看不到可用的原生生图工具后，容易回退到本地 SVG/HTML/CSS/Python 渲染，最终无法产出真实位图。
+
+本分支的技术方案是保留客户端侧 WebSocket 协议不变，但在 sub2api 内部把“携带用户消息的图片生成 turn”桥接为 HTTP POST 请求，打到 `chatgpt.com/backend-api/codex/responses`。该 HTTP Responses 端点会接受外部注入的 `image_generation` 工具，因此可以让上游模型走原生图片生成能力；上游返回的 SSE 事件再逐条回放成 WebSocket 文本消息发回 Codex 客户端。
+
+关键链路如下：
+
+1. 首条 WS 消息只做桥接资格判定和工具/指令注入：必须是官方 Codex 客户端、API Key 分组允许图片生成，并且 `codex_image_generation_bridge_enabled` 或账号/渠道覆盖配置开启。
+2. Codex 的真实用户输入通常出现在 turn 2+，因此分支在 WebSocket 转发循环的 `BeforeRequest` 钩子里用 `WSPayloadHasInput` 判断当前 payload 是否包含用户消息，避免误拦截纯工具结果轮次。
+3. 命中后调用 `ProxyImageGenViaHTTP`：用原始用户 `input` 组装 HTTP Responses 请求，只注入聚焦的图片生成桥接指令和 `image_generation` 工具，避免庞大的 Codex 编程系统提示干扰生图语义。
+4. HTTP 上游以 SSE 返回 `response.image_generation_call.partial_image`、`response.output_item.done`、`response.completed` 等事件；sub2api 使用更大的 scanner 缓冲处理 base64 图片片段，并把每条 `data:` 事件回写给 WS 客户端。
+5. 桥接成功后以正常关闭结束该 WS 连接；桥接失败时不直接断开，而是 graceful fall-through 回到原 WS 转发路径，避免触发 Codex 客户端重连风暴。
+
+配套改动还补充了 `WSPayloadHasInput`、Codex WS 桥接注入、图片生成控制等测试，并新增了技术说明文档：[docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md](docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md)。
+
 <div align="center">
 
 [![Go](https://img.shields.io/badge/Go-1.25.7-00ADD8.svg)](https://golang.org/)
