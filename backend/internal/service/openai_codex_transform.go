@@ -739,24 +739,43 @@ var (
 // turn when a continuation cue co-occurs with an earlier image-intent user message in the
 // same (full-replay) payload.
 func codexWSImageIntent(payload []byte) bool {
+	return codexWSUserItemsImageIntent(codexWSCollectUserItems(payload))
+}
+
+// codexWSIsUserItem reports whether an input item is a user-authored message rather than
+// a tool result / function-call-output turn.
+func codexWSIsUserItem(item gjson.Result) bool {
+	itemType := strings.TrimSpace(item.Get("type").String())
+	role := strings.TrimSpace(item.Get("role").String())
+	return role == "user" || itemType == "input_text" ||
+		(itemType == "message" && (role == "" || role == "user"))
+}
+
+// codexWSCollectUserItems extracts the user-authored input items of a WS payload, parsing
+// the payload exactly once. The has-input and image-intent checks share this so a single
+// turn never re-parses the (potentially multi-MB) payload twice.
+func codexWSCollectUserItems(payload []byte) []gjson.Result {
 	input := gjson.GetBytes(payload, "input")
 	if !input.Exists() || !input.IsArray() {
-		return false
+		return nil
 	}
 	var userItems []gjson.Result
 	for _, item := range input.Array() {
-		itemType := strings.TrimSpace(item.Get("type").String())
-		role := strings.TrimSpace(item.Get("role").String())
-		isUser := role == "user" || itemType == "input_text" ||
-			(itemType == "message" && (role == "" || role == "user"))
-		if isUser {
+		if codexWSIsUserItem(item) {
 			userItems = append(userItems, item)
 		}
 	}
+	return userItems
+}
+
+// codexWSUserItemsImageIntent judges image generation/edit intent from already-collected
+// user items: it inspects the latest message directly, and for elliptical follow-ups
+// ("再来一张" / "another one") only fires when an earlier user message in the same payload
+// already asked for an image.
+func codexWSUserItemsImageIntent(userItems []gjson.Result) bool {
 	if len(userItems) == 0 {
 		return false
 	}
-
 	lastText, hasInputImage := codexWSUserMessageContent(userItems[len(userItems)-1])
 	if hasInputImage || matchImageIntentText(lastText) {
 		return true

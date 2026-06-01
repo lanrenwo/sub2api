@@ -475,6 +475,11 @@ func (s *OpenAIGatewayService) isCodexImageGenerationBridgeEnabled(ctx context.C
 	return s != nil && s.cfg != nil && s.cfg.Gateway.CodexImageGenerationBridgeEnabled
 }
 
+// codexImageBridgeHTTPClient is shared across image-bridge turns so they reuse the
+// underlying connection pool (http.DefaultTransport); the long timeout covers
+// multi-minute image generations.
+var codexImageBridgeHTTPClient = &http.Client{Timeout: 10 * time.Minute}
+
 // ProxyImageGenViaHTTP handles a Codex WS session's image generation turn by routing
 // the request through HTTP POST to the chatgpt.com Responses endpoint (which supports
 // externally-injected image_generation tools), and relays the SSE response back to the
@@ -543,8 +548,7 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 
 	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: sending HTTP POST to chatgpt.com body_bytes=%d", len(bodyBytes))
 
-	httpClient := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := httpClient.Do(req)
+	resp, err := codexImageBridgeHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http upstream: %w", err)
 	}
@@ -557,7 +561,10 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 
 	// Relay SSE events to WS client.
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 32<<20), 32<<20) // 32MB for partial_image base64 data
+	// Start at 64KB and let the scanner grow on demand up to 32MB; most SSE lines are
+	// tiny, only partial_image base64 chunks are large, so this avoids a 32MB up-front
+	// allocation on every image turn.
+	scanner.Buffer(make([]byte, 0, 64<<10), 32<<20)
 	completed := false
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -593,6 +600,15 @@ func (s *OpenAIGatewayService) IsCodexWSImageIntent(payload []byte) bool {
 	return codexWSImageIntent(payload)
 }
 
+// WSPayloadShouldBridgeImageGen reports whether a Codex WS turn should be routed through
+// the HTTP image bridge: the turn must carry a user-authored message AND that message must
+// express an image generation/edit intent. It parses the payload exactly once, replacing
+// the former WSPayloadHasInput + IsCodexWSImageIntent two-pass check (an image intent
+// already implies a user message, so the has-input gate was redundant).
+func (s *OpenAIGatewayService) WSPayloadShouldBridgeImageGen(payload []byte) bool {
+	return codexWSUserItemsImageIntent(codexWSCollectUserItems(payload))
+}
+
 // WSPayloadHasInput returns true when the WS payload contains a user-authored
 // input message. Tool-only turns are not user prompts and must not trigger the
 // HTTP image bridge fallback.
@@ -601,19 +617,12 @@ func (s *OpenAIGatewayService) WSPayloadHasInput(payload []byte) bool {
 	if !input.Exists() || !input.IsArray() {
 		return false
 	}
-	hasUserMessage := false
 	for _, item := range input.Array() {
-		itemType := strings.TrimSpace(item.Get("type").String())
-		role := strings.TrimSpace(item.Get("role").String())
-		if role == "user" || itemType == "input_text" {
-			hasUserMessage = true
-			continue
-		}
-		if itemType == "message" && (role == "" || role == "user") {
-			hasUserMessage = true
+		if codexWSIsUserItem(item) {
+			return true
 		}
 	}
-	return hasUserMessage
+	return false
 }
 
 // ApplyCodexImageGenerationBridgeToWSPayload injects the image_generation tool and bridge
