@@ -59,6 +59,11 @@ func TestRelayImageBridgeSSE_RelaysDataAndExtractsUsage(t *testing.T) {
 	if result.ResponseID != "resp_abc" {
 		t.Fatalf("expected ResponseID=resp_abc, got %q", result.ResponseID)
 	}
+	// RequestID must mirror the WS path (RequestID: responseID) so the usage record is
+	// traceable rather than blank.
+	if result.RequestID != "resp_abc" {
+		t.Fatalf("expected RequestID=resp_abc (matching WS path), got %q", result.RequestID)
+	}
 	if !result.OpenAIWSMode {
 		t.Fatal("expected OpenAIWSMode=true so usage records as a WS turn")
 	}

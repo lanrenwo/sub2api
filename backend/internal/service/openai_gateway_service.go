@@ -531,6 +531,10 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	if err != nil {
 		return nil, false, fmt.Errorf("build http request: %w", err)
 	}
+	// Select the OpenAI upstream client profile (HTTP/2 settings + connection pool tuned to
+	// match a real Codex client), exactly like the normal OAuth HTTP path — chatgpt.com sits
+	// behind Cloudflare and the default profile risks fingerprint challenges/403.
+	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
 	req.Host = "chatgpt.com"
 	req.Header.Set("authorization", "Bearer "+token)
 	req.Header.Set("content-type", "application/json")
@@ -662,6 +666,7 @@ func (s *OpenAIGatewayService) buildImageBridgeResult(
 	originalModel, mappedModel string,
 ) *OpenAIForwardResult {
 	result := &OpenAIForwardResult{
+		RequestID:     responseID,
 		ResponseID:    responseID,
 		Usage:         usage,
 		Model:         originalModel,
