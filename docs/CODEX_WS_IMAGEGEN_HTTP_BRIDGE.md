@@ -89,6 +89,24 @@ turn 2+（BeforeRequest 钩子）：
   - `ApplyCodexImageGenerationBridgeToWSPayload`：在满足条件（官方 Codex 客户端、分组允许
     生图、桥接开关开启）时注入工具与桥接指令，作为 `imageBridgeActive` 的判定依据。
 
+## 已知限制（方案天花板）
+
+以下是 WS→HTTP 桥接这条路线的固有弱点，并非实现 bug，短期接受、长期需上游放开
+WS 工具注入才能根治：
+
+1. **关键词意图门会静默漏判。** 桥接由 `WSPayloadShouldBridgeImageGen` 的中英文
+   关键词/正则把守。不命中"生成动词 + 图片名词共现"的表达（如"做个 banner"、
+   "whip up a logo"、"来个 favicon"）会**漏判**，回落正常 WS——而 WS 后端会剥掉
+   注入的 `image_generation` 工具，模型重新退回 SVG/HTML/脚本假图，**且不产生任何
+   报错**。反之，编码 turn 也可能被**误判**为生图，导致该轮丢失 Codex 编码系统提示。
+   这道门无法同时做到不漏判与不误判，是本方案最脆弱的一环。
+
+2. **上下文断裂。** 桥接是 `store:false` 的一次性 HTTP 调用，只带聚焦的桥接指令与
+   用户本轮 `input`，**既不带 Codex 系统提示，也不带 `previous_response_id`/会话历史**。
+   因此图片 turn 与正在进行的 WS 会话彼此不可见：后续 WS turn 的上游不知道刚生成过图，
+   "基于刚才那段代码画一张架构图"这类跨上下文生图也无法实现。对"纯一次性生图"够用，
+   对"对话中穿插生图"会有体感割裂。
+
 ## 一句话总结
 
 客户端继续走 WS，sub2api 把携带用户消息的生图 turn 在 `BeforeRequest` 钩子里截下来、
