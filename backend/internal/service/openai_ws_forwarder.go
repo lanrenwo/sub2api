@@ -2871,13 +2871,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		turnStart := time.Now()
 		wroteDownstream := false
-		{
-			var dbg map[string]any
-			if json.Unmarshal(payload, &dbg) == nil {
-				_, ht := dbg["tools"]
-				logOpenAIWSModeInfo("[OpenAI] WS sendAndRelay turn=%d account_id=%d has_tools=%v payload_bytes=%d", turn, account.ID, ht, len(payload))
-			}
-		}
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",

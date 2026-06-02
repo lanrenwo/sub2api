@@ -733,15 +733,6 @@ var (
 	reEnImageFollowup   = regexp.MustCompile(`\b(another( one)?|one more|do another|make another)\b`)
 )
 
-// codexWSImageIntent reports whether the WS payload expresses an image generation or
-// editing intent. It judges the latest user message directly; for elliptical follow-ups
-// ("再来一张" / "another one") that carry no image noun of their own, it also accepts the
-// turn when a continuation cue co-occurs with an earlier image-intent user message in the
-// same (full-replay) payload.
-func codexWSImageIntent(payload []byte) bool {
-	return codexWSUserItemsImageIntent(codexWSCollectUserItems(payload))
-}
-
 // codexWSIsUserItem reports whether an input item is a user-authored message rather than
 // a tool result / function-call-output turn.
 func codexWSIsUserItem(item gjson.Result) bool {
@@ -900,24 +891,6 @@ func applyCodexImageGenerationBridgeInstructions(reqBody map[string]any) bool {
 	}
 
 	reqBody["instructions"] = existing + "\n\n" + codexImageGenerationBridgeText
-	return true
-}
-
-// applyCodexImageGenerationBridgeInstructionsForWS replaces the instructions field
-// entirely with the bridge text so the model sees it as the primary directive rather
-// than an addendum that competing SKILL.md logic can override.
-func applyCodexImageGenerationBridgeInstructionsForWS(reqBody map[string]any) bool {
-	if len(reqBody) == 0 || !hasOpenAIImageGenerationTool(reqBody) {
-		return false
-	}
-	if isCodexSparkModel(firstNonEmptyString(reqBody["model"])) {
-		return false
-	}
-	existing, _ := reqBody["instructions"].(string)
-	if strings.Contains(existing, codexImageGenerationBridgeMarker) {
-		return false
-	}
-	reqBody["instructions"] = codexImageGenerationBridgeText
 	return true
 }
 

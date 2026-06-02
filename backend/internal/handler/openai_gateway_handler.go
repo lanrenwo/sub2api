@@ -1383,6 +1383,42 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// 真正的用户消息在 turn 2+ 才到达，需在 BeforeRequest 中拦截走 HTTP Responses。
 		imageBridgeActive := false
 
+		// recordBridgeUsage 对图片桥接 turn 记账，复用与普通 WS turn (AfterTurn) 完全一致的
+		// 用量上报链路——桥接走 HTTP 直发上游，若不在此记账，这些图片生成将完全不计费/不计额度。
+		recordBridgeUsage := func(result *service.OpenAIForwardResult) {
+			if result == nil {
+				return
+			}
+			if account.Type == service.AccountTypeOAuth {
+				h.gatewayService.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, result.ResponseHeaders)
+			}
+			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, true, result.FirstTokenMs)
+			inboundEndpoint := GetInboundEndpoint(c)
+			upstreamEndpoint := GetUpstreamEndpoint(c, account.Platform)
+			h.submitOpenAIUsageRecordTask(ctx, result, func(taskCtx context.Context) {
+				if err := h.gatewayService.RecordUsage(taskCtx, &service.OpenAIRecordUsageInput{
+					Result:             result,
+					APIKey:             apiKey,
+					User:               apiKey.User,
+					Account:            account,
+					Subscription:       subscription,
+					InboundEndpoint:    inboundEndpoint,
+					UpstreamEndpoint:   upstreamEndpoint,
+					UserAgent:          userAgent,
+					IPAddress:          clientIP,
+					RequestPayloadHash: service.HashUsageRequestPayload(firstMessage),
+					APIKeyService:      h.apiKeyService,
+					ChannelUsageFields: channelMappingWS.ToUsageFields(reqModel, result.UpstreamModel),
+				}); err != nil {
+					reqLog.Error("openai.imagegen_bridge_record_usage_failed",
+						zap.Int64("account_id", account.ID),
+						zap.String("request_id", result.RequestID),
+						zap.Error(err),
+					)
+				}
+			})
+		}
+
 		hooks := &service.OpenAIWSIngressHooks{
 			InitialRequestModel: reqModel,
 			BeforeRequest: func(turn int, payload []byte, originalModel string) error {
@@ -1409,11 +1445,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 由上游原生 image_generation 直接生图，SSE 回放给 WS 客户端后正常关闭连接。
 				// 普通编码 turn 不命中意图门，继续走正常 WS，避免被劫持到 image-gen 路径。
 				if imageBridgeActive && h.gatewayService.WSPayloadShouldBridgeImageGen(payload) {
-					if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, payload); err != nil {
-						reqLog.Warn("openai.imagegen_http_bridge_turn_failed", zap.Int("turn", turn), zap.Error(err))
-						// HTTP 桥失败时回落正常 WS，避免断开触发 Codex 重连。
+					result, wroteDownstream, err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, payload)
+					if err != nil {
+						reqLog.Warn("openai.imagegen_http_bridge_turn_failed", zap.Int("turn", turn), zap.Bool("wrote_downstream", wroteDownstream), zap.Error(err))
+						if wroteDownstream {
+							// 已向客户端写入部分 SSE，再回落正常 WS 会让客户端收到重复/污染的响应流，
+							// 因此必须终止连接而非 return nil。
+							return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "image generation bridge failed mid-stream", err)
+						}
+						// 尚未写入任何下游，回落正常 WS，避免断开触发 Codex 重连。
 						return nil
 					}
+					recordBridgeUsage(result)
 					return service.NewOpenAIWSClientCloseError(coderws.StatusNormalClosure, "", nil)
 				}
 				return nil
@@ -1517,10 +1560,16 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			if h.gatewayService.WSPayloadShouldBridgeImageGen(wsFirstMessage) {
 				// chatgpt.com WS 后端会剥离外部注入的 server tool；仅当首条消息确实表达
 				// 生图/改图意图时才走 HTTP Responses，由上游原生 image_generation 工具生图。
-				if err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, wsFirstMessage); err != nil {
-					reqLog.Warn("openai.imagegen_http_bridge_failed", zap.Error(err))
-					// HTTP 桥失败时回落到正常 WS，避免直接断开 Codex 客户端。
+				result, wroteDownstream, err := h.gatewayService.ProxyImageGenViaHTTP(ctx, c, wsConn, account, token, wsFirstMessage)
+				if err != nil {
+					reqLog.Warn("openai.imagegen_http_bridge_failed", zap.Bool("wrote_downstream", wroteDownstream), zap.Error(err))
+					if wroteDownstream {
+						// 已写入部分 SSE，回落正常 WS 会重发整轮、污染响应流，直接结束本连接。
+						return
+					}
+					// 尚未写入任何下游，回落正常 WS，避免直接断开 Codex 客户端。
 				} else {
+					recordBridgeUsage(result)
 					return
 				}
 			}

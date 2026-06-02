@@ -7,30 +7,33 @@
 | 对比项 | 旧逻辑 | 当前分支 |
 | --- | --- | --- |
 | 客户端协议 | Codex 客户端通过 WS 连接 sub2api | 保持不变，客户端仍然只感知 WS |
-| 上游转发路径 | sub2api 继续用 WS 转发到 `chatgpt.com` | 命中图片生成 turn 时，内部改用 HTTP POST 到 `chatgpt.com/backend-api/codex/responses` |
+| 上游转发路径 | sub2api 继续用 WS 转发到 `chatgpt.com` | 命中图片生成 turn 时，内部改用 HTTP POST 到 `chatgpt.com/backend-api/codex/responses`，并复用账号配置的 proxy 出口（与会话其余部分共享 egress IP，避免风控关联） |
 | `image_generation` 工具 | sub2api 即使注入工具，也会被 `chatgpt.com` WS 后端剥离 | HTTP Responses 端点接受外部注入的 `image_generation` 工具 |
 | 模型行为 | 模型看不到原生生图工具，容易回退到 SVG/HTML/CSS/Python 等本地渲染 | 模型能调用原生 `image_generation`，直接产出真实位图 |
-| turn 处理 | 早期只在首条 WS 消息判断，首条通常没有真实用户输入，turn 2+ 会绕过桥接 | 首条消息只标记桥接启用；turn 2+ 在 `BeforeRequest` 钩子中用 `WSPayloadHasInput` 精准拦截 |
+| turn 处理 | 早期只在首条 WS 消息判断，首条通常没有真实用户输入，turn 2+ 会绕过桥接 | 首条消息只标记桥接启用；turn 2+ 在 `BeforeRequest` 钩子中用 `WSPayloadShouldBridgeImageGen` 精准拦截命中生图意图的轮次 |
 | 请求指令 | Codex 大段编程系统提示可能干扰图片任务 | HTTP 桥接请求只保留聚焦的图片生成桥接指令，并原样传递用户 `input` |
 | 响应回放 | WS 上游无法稳定产生图片生成事件 | 上游 HTTP SSE 事件逐条回写给 WS 客户端，支持大 base64 `partial_image` 片段 |
-| 失败策略 | 桥接失败容易导致断连和 Codex 重连 | HTTP 桥接失败时 graceful fall-through，回到原 WS 转发路径 |
+| 计费 | —— | 桥接 turn 解析上游 `usage` 与图片产出，走与普通 WS turn 完全一致的用量上报链路计费/计额度 |
+| 失败策略 | 桥接失败容易导致断连和 Codex 重连 | 尚未向客户端写入任何 SSE 时，graceful fall-through 回原 WS 转发路径；已写入部分响应后失败则直接关闭连接，避免回落重发污染响应流 |
 | 配置开关 | 无专门 WS 生图桥接路径 | 需满足官方 Codex 客户端、分组允许图片生成，并开启 `codex_image_generation_bridge_enabled` 或账号/渠道覆盖配置 |
 
 关键实现点：
 
 - `ResponsesWebSocket`：新增 `imageBridgeActive`，在首条 WS 消息完成桥接资格判定，在 turn 2+ 的 `BeforeRequest` 钩子中触发 HTTP 桥接。
-- `ProxyImageGenViaHTTP`：构造 HTTP Responses 请求，注入 `image_generation` 工具，把上游 SSE `data:` 事件写回 Codex WS 客户端。
-- `WSPayloadHasInput`：只识别包含用户消息的 payload，避免把纯工具结果轮次误判为图片生成请求。
-- 测试覆盖：补充了 WS payload 输入识别、Codex WS 桥接注入、图片生成控制等用例。
+- `ProxyImageGenViaHTTP`：构造 HTTP Responses 请求（经账号 proxy 出口），注入 `image_generation` 工具，把上游 SSE `data:` 事件写回 Codex WS 客户端，并返回用于计费的 `OpenAIForwardResult` 及 `wroteDownstream` 标志。
+- `relayImageBridgeSSE`：SSE 中继的可测核心，逐条回写事件、累计 `usage` 与图片产出，并报告是否已写过下游（决定失败时能否安全回落）。
+- `WSPayloadShouldBridgeImageGen`：单次解析 payload，仅当最后一条用户消息表达生图/改图意图时才放行桥接，纯工具结果轮次与无前文铺垫的省略式追问被排除。
+- 测试覆盖：补充了 SSE 中继/回落判定/计费提取、生图意图识别、Codex WS 桥接注入、图片生成控制等用例。
 
 图片意图识别方式：
 
 | 场景 | 识别方式 | 说明 |
 | --- | --- | --- |
 | 普通 HTTP / Responses 请求 | 结构化字段判断 | 命中图片 endpoint、image model、`tools[].type == "image_generation"` 或 `tool_choice` 选择 `image_generation` 时，判定为图片生成请求 |
-| Codex WS 桥接 | 不做关键词分类 | 网关只判断官方 Codex 客户端、图片权限、桥接开关和当前 turn 是否包含用户消息；是否真正需要生图由上游模型基于用户语义和注入的 `image_generation` 工具决定 |
-| 用户自然语言 | 不扫描关键词 | 不依赖“画一张”“生成海报”“换背景”等文本规则，避免中文/英文/编辑任务/风格迁移等表达漏判或误判 |
-| 工具结果 turn | 明确排除 | `WSPayloadHasInput` 只接受用户消息，避免函数结果、工具输出等非用户输入触发 HTTP 桥接 |
+| Codex WS 桥接 | 资格门 + 意图门 | 先判断官方 Codex 客户端、分组图片权限、桥接开关（资格门）；再由 `WSPayloadShouldBridgeImageGen` 对**最后一条用户消息**做意图判定（意图门），两者同时满足才走 HTTP 桥接，普通编码 turn 继续走 WS |
+| 用户自然语言 | 关键词/正则意图识别 | 要求生成动词与图片名词共现（中文 `生成/画/绘制…` + `图片/海报/头像…`，英文 `generate/draw…` + `image/poster…`），并识别改图短语（抠图/改图/`edit the photo`）与换背景等编辑意图；裸"图"通过排除表过滤掉图表/图标/图层等非图片语义 |
+| 续作追问 | 省略式 + 上下文回看 | "再来一张"/"another one" 这类无图片名词的省略追问，仅当同一 payload 更早的用户消息已表达生图意图时才放行，避免编码会话里的"再来一个"误触发 |
+| 工具结果 turn | 明确排除 | `codexWSCollectUserItems` 只收集用户消息，函数调用结果、工具输出等非用户输入不会触发 HTTP 桥接 |
 
 详细技术说明见：[docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md](docs/CODEX_WS_IMAGEGEN_HTTP_BRIDGE.md)。
 

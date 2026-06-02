@@ -34,7 +34,7 @@ Codex 的 WS 会话是**多轮（multi-turn）**的：
 | turn 2+       | 用户真正的提问（如"生成一张海报"）                  | **在这里**            |
 
 早期实现只在**首条消息**上做桥接判断：首条消息 `bridge_applied=true`（工具注入成功），
-但 `WSPayloadHasInput=false`（没有用户消息），桥接不触发；而真正携带用户消息的 turn 2+
+但其中没有真正的用户消息，桥接不触发；而真正携带用户消息的 turn 2+
 走的是 `ProxyResponsesWebSocketFromClient` 内部循环，**完全绕过了桥接**，又被上游 WS 剥掉
 工具而失败。
 
@@ -47,10 +47,11 @@ Codex 的 WS 会话是**多轮（multi-turn）**的：
 首条消息：判定 bridge_applied → 置 imageBridgeActive = true（仅标记本连接启用桥接，不实际转发）
         ↓
 turn 2+（BeforeRequest 钩子）：
-    if imageBridgeActive && WSPayloadHasInput(payload):   // 这一轮带用户消息
-        ProxyImageGenViaHTTP(...)  // HTTP POST 到 chatgpt.com，注入 image_generation 工具
-        成功 → 把上游 SSE 逐条回放成 WS 消息，再以 StatusNormalClosure 正常关闭
-        失败 → return nil，回落正常 WS（不断连，避免触发 Codex 重连风暴）
+    if imageBridgeActive && WSPayloadShouldBridgeImageGen(payload):  // 这一轮的用户消息表达生图意图
+        result, wroteDownstream, err := ProxyImageGenViaHTTP(...)  // 经账号 proxy 出口 HTTP POST，注入 image_generation 工具
+        err == nil → recordBridgeUsage(result) 计费，再以 StatusNormalClosure 正常关闭
+        err != nil 且 wroteDownstream == false → return nil，回落正常 WS（不断连，避免触发 Codex 重连风暴）
+        err != nil 且 wroteDownstream == true  → 已写入部分 SSE，关闭连接（回落重发会污染响应流）
 ```
 
 ## `ProxyImageGenViaHTTP` 内部细节
@@ -61,20 +62,30 @@ turn 2+（BeforeRequest 钩子）：
    `codexImageGenerationBridgeText`，并将用户真实的 `input` 原样带上——与 CRS 用
    `CODEX_CLI_INSTRUCTIONS` 替换 instructions 的做法一致。
 
-2. **SSE 中继的健壮处理：**
-   - 使用 32MB 的 scanner 缓冲，应对 `partial_image` 的大段 base64 数据；
+2. **SSE 中继的健壮处理（`relayImageBridgeSSE`）：**
+   - 使用初始 64KB、按需增长至 32MB 的 scanner 缓冲，应对 `partial_image` 的大段 base64 数据；
    - `chatgpt.com` 的流通常不发送 `[DONE]` 即直接断开，因此**收到 `response.completed`
-     事件后，即使随后遇到 EOF 也判定为成功**。
+     事件后，即使随后遇到 EOF 也判定为成功**；
+   - 一旦向客户端写过任意事件即置 `wroteDownstream = true`，作为上层"失败能否安全回落"的依据。
+
+3. **走账号 proxy 出口。** 通过 `s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)`
+   发送，复用账号配置的 proxy 与共享连接池，使桥接请求与会话其余部分共享 egress IP，避免
+   IP 不一致导致的失败或账号关联风控。
+
+4. **计费。** 中继时解析终止事件里的 `usage` 与图片产出，构造 `OpenAIForwardResult` 返回，
+   上层 `recordBridgeUsage` 走与普通 WS turn 完全一致的 `RecordUsage` 链路记账/计额度。
 
 ## 涉及的代码
 
 - `backend/internal/handler/openai_gateway_handler.go`
-  - `ResponsesWebSocket`：新增 `imageBridgeActive` 标记；在 `BeforeRequest` 钩子中拦截
-    携带用户消息的 turn 2+，转走 HTTP 桥接，成功后正常关闭、失败回落 WS。
+  - `ResponsesWebSocket`：新增 `imageBridgeActive` 标记与 `recordBridgeUsage` 闭包；在
+    `BeforeRequest` 钩子中拦截命中生图意图的 turn 2+，成功记账后正常关闭；失败时按
+    `wroteDownstream` 决定回落 WS 还是关闭连接。
 - `backend/internal/service/openai_gateway_service.go`
-  - `ProxyImageGenViaHTTP`：构造 HTTP 请求打到 `chatgpt.com/backend-api/codex/responses`，
-    注入 `image_generation` 工具，并把上游 SSE 回放为 WS 消息。
-  - `WSPayloadHasInput`：判定一个 WS payload 是否携带用户消息（区别于纯工具结果轮次）。
+  - `ProxyImageGenViaHTTP`：经账号 proxy 构造 HTTP 请求打到 `chatgpt.com/backend-api/codex/responses`，
+    注入 `image_generation` 工具，返回 `(result, wroteDownstream, err)`。
+  - `relayImageBridgeSSE` / `buildImageBridgeResult`：SSE 中继与计费结果构造的可测核心。
+  - `WSPayloadShouldBridgeImageGen`：单次解析 payload，判定最后一条用户消息是否表达生图意图。
   - `ApplyCodexImageGenerationBridgeToWSPayload`：在满足条件（官方 Codex 客户端、分组允许
     生图、桥接开关开启）时注入工具与桥接指令，作为 `imageBridgeActive` 的判定依据。
 

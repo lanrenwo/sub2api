@@ -475,15 +475,16 @@ func (s *OpenAIGatewayService) isCodexImageGenerationBridgeEnabled(ctx context.C
 	return s != nil && s.cfg != nil && s.cfg.Gateway.CodexImageGenerationBridgeEnabled
 }
 
-// codexImageBridgeHTTPClient is shared across image-bridge turns so they reuse the
-// underlying connection pool (http.DefaultTransport); the long timeout covers
-// multi-minute image generations.
-var codexImageBridgeHTTPClient = &http.Client{Timeout: 10 * time.Minute}
-
 // ProxyImageGenViaHTTP handles a Codex WS session's image generation turn by routing
 // the request through HTTP POST to the chatgpt.com Responses endpoint (which supports
 // externally-injected image_generation tools), and relays the SSE response back to the
 // WS client as individual WS text messages.
+//
+// It returns the forward result (for usage/billing), wroteDownstream (true once any SSE
+// event has been written to the WS client), and an error. When wroteDownstream is true the
+// caller MUST close the connection rather than fall through to the normal WS path — the
+// client already owns this turn, and replaying it over WS would duplicate/corrupt the
+// stream.
 func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	ctx context.Context,
 	c *gin.Context,
@@ -491,48 +492,44 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	account *Account,
 	token string,
 	wsPayload []byte,
-) error {
+) (result *OpenAIForwardResult, wroteDownstream bool, err error) {
 	// Build HTTP body from the original (pre-injection) WS payload. This path is
-	// only used after WSPayloadHasInput confirms a user-authored message exists.
+	// only reached after WSPayloadShouldBridgeImageGen confirms a user-authored
+	// image-generation message exists.
 	var wsBody map[string]any
 	if err := json.Unmarshal(wsPayload, &wsBody); err != nil {
-		return fmt.Errorf("parse ws payload: %w", err)
+		return nil, false, fmt.Errorf("parse ws payload: %w", err)
 	}
 
 	model, _ := wsBody["model"].(string)
-	originalInstructions, _ := wsBody["instructions"].(string)
 	originalInput, _ := wsBody["input"].([]any)
 	if len(originalInput) == 0 {
-		return errors.New("missing user input for image generation bridge")
+		return nil, false, errors.New("missing user input for image generation bridge")
 	}
 
 	// Use only bridge text as instructions — the full Codex system prompt (~13KB) would
 	// dominate and cause the model to generate images from the coding-assistant context
 	// rather than from the user's actual request in input. CRS does the same: replaces
 	// instructions with a focused prompt (CODEX_CLI_INSTRUCTIONS) before forwarding.
-	combinedInstructions := codexImageGenerationBridgeText
-
 	body := map[string]any{
 		"model":        model,
 		"input":        originalInput,
-		"instructions": combinedInstructions,
+		"instructions": codexImageGenerationBridgeText,
 		"tools":        []any{map[string]any{"type": "image_generation", "output_format": "png"}},
 		"store":        false,
 		"stream":       true,
 	}
 
-	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: original_instr_len=%d input_items=%d combined_instr_len=%d", len(originalInstructions), len(originalInput), len(combinedInstructions))
-
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal http body: %w", err)
+		return nil, false, fmt.Errorf("marshal http body: %w", err)
 	}
 
 	// Build request directly — buildUpstreamRequest is designed for the HTTP handler path
 	// and may misbehave with a WS gin.Context. We construct the request manually.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatgptCodexURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return fmt.Errorf("build http request: %w", err)
+		return nil, false, fmt.Errorf("build http request: %w", err)
 	}
 	req.Host = "chatgpt.com"
 	req.Header.Set("authorization", "Bearer "+token)
@@ -541,36 +538,84 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 	if chatgptAccountID := account.GetChatGPTAccountID(); chatgptAccountID != "" {
 		req.Header.Set("chatgpt-account-id", chatgptAccountID)
 	}
-	if account.Proxy != nil {
-		// Proxy support left to future work; skip for now.
-		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: account has proxy configured but proxy is not applied in this path")
+
+	// Route through the account's proxy (and shared upstream client pool) so the bridge
+	// shares the egress IP of the rest of the session — a mismatch can fail outright or
+	// trip account-association risk control on the OAuth account.
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
 	}
-
-	logger.LegacyPrintf("service.openai_gateway", "[OpenAI] ProxyImageGenViaHTTP: sending HTTP POST to chatgpt.com body_bytes=%d", len(bodyBytes))
-
-	resp, err := codexImageBridgeHTTPClient.Do(req)
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
-		return fmt.Errorf("http upstream: %w", err)
+		return nil, false, fmt.Errorf("http upstream: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		rb, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(rb))
+		return nil, false, fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(rb))
 	}
 
-	// Relay SSE events to WS client.
-	scanner := bufio.NewScanner(resp.Body)
+	write := func(data []byte) error {
+		writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return wsConn.Write(writeCtx, coderws.MessageText, data)
+	}
+	result, wroteDownstream, err = s.relayImageBridgeSSE(resp.Body, write, model, model)
+	// Resolve the image billing model from the bridge body (which carries the injected
+	// image_generation tool), mirroring the WS path so an image turn bills under the
+	// image model (e.g. gpt-image-2) rather than the coding request model.
+	s.applyImageBridgeBillingModel(result, bodyBytes, model)
+	return result, wroteDownstream, err
+}
+
+// applyImageBridgeBillingModel fills in the image billing model and size tier on a bridge
+// turn's result, matching how the normal WS path resolves image billing. It is a no-op for
+// non-image turns.
+func (s *OpenAIGatewayService) applyImageBridgeBillingModel(result *OpenAIForwardResult, body []byte, fallbackModel string) {
+	if result == nil || result.ImageCount <= 0 {
+		return
+	}
+	imageCfg, err := resolveOpenAIResponsesImageBillingConfigDetailedFromBody(body, fallbackModel)
+	if err != nil {
+		return
+	}
+	result.BillingModel = imageCfg.Model
+	if result.ImageSize == "" {
+		result.ImageSize = imageCfg.SizeTier
+	}
+	if result.ImageInputSize == "" {
+		result.ImageInputSize = imageCfg.InputSize
+	}
+}
+
+// relayImageBridgeSSE reads an upstream SSE stream, relays each `data:` event to the WS
+// client via write, and accumulates token usage and image-output counts into a forward
+// result for billing. It is the testable core of ProxyImageGenViaHTTP.
+//
+// wroteDownstream becomes true once any event has been handed to write (including a write
+// that then failed because the client disconnected). The caller uses it to decide whether
+// falling through to the normal WS path is safe: it is only safe when nothing was written.
+func (s *OpenAIGatewayService) relayImageBridgeSSE(
+	body io.Reader,
+	write func(data []byte) error,
+	originalModel, mappedModel string,
+) (*OpenAIForwardResult, bool, error) {
+	scanner := bufio.NewScanner(body)
 	// Start at 64KB and let the scanner grow on demand up to 32MB; most SSE lines are
 	// tiny, only partial_image base64 chunks are large, so this avoids a 32MB up-front
 	// allocation on every image turn.
 	scanner.Buffer(make([]byte, 0, 64<<10), 32<<20)
+
+	var usage OpenAIUsage
+	imageCounter := newOpenAIImageOutputCounter()
+	responseID := ""
 	completed := false
+	wroteDownstream := false
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "event: response.completed") {
-			completed = true
-		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -578,51 +623,65 @@ func (s *OpenAIGatewayService) ProxyImageGenViaHTTP(
 		if data == "[DONE]" {
 			break
 		}
-		writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		werr := wsConn.Write(writeCtx, coderws.MessageText, []byte(data))
-		cancel()
-		if werr != nil {
-			return nil // client disconnected
+		dataBytes := []byte(data)
+		// Accumulate billing signals from every event before relaying.
+		s.parseSSEUsageBytes(dataBytes, &usage)
+		imageCounter.AddSSEData(dataBytes)
+		if id := gjson.GetBytes(dataBytes, "response.id"); id.Exists() {
+			responseID = strings.TrimSpace(id.String())
+		} else if responseID == "" {
+			if id := gjson.GetBytes(dataBytes, "id"); id.Exists() {
+				responseID = strings.TrimSpace(id.String())
+			}
 		}
+		switch gjson.GetBytes(dataBytes, "type").String() {
+		case "response.completed", "response.done":
+			completed = true
+		}
+		if err := write(dataBytes); err != nil {
+			// Client disconnected mid-stream. The turn already belongs to the bridge, so
+			// report wroteDownstream=true with no error: the caller closes the WS rather
+			// than replaying the turn over the normal path.
+			return s.buildImageBridgeResult(responseID, usage, imageCounter, originalModel, mappedModel), true, nil
+		}
+		wroteDownstream = true
 	}
 	// chatgpt.com SSE streams typically end with an abrupt close rather than [DONE].
 	// Treat EOF after response.completed as success.
 	if scanErr := scanner.Err(); scanErr != nil && !completed {
-		return scanErr
+		return nil, wroteDownstream, scanErr
 	}
-	return nil
+	return s.buildImageBridgeResult(responseID, usage, imageCounter, originalModel, mappedModel), wroteDownstream, nil
 }
 
-// IsCodexWSImageIntent reports whether the latest user message in a Codex WS payload
-// expresses an image generation/editing intent. Only turns that pass this gate are
-// routed through the HTTP image bridge; ordinary coding turns stay on WS.
-func (s *OpenAIGatewayService) IsCodexWSImageIntent(payload []byte) bool {
-	return codexWSImageIntent(payload)
+// buildImageBridgeResult assembles the forward result billed for an image-bridge turn.
+func (s *OpenAIGatewayService) buildImageBridgeResult(
+	responseID string,
+	usage OpenAIUsage,
+	imageCounter *openAIImageOutputCounter,
+	originalModel, mappedModel string,
+) *OpenAIForwardResult {
+	result := &OpenAIForwardResult{
+		ResponseID:    responseID,
+		Usage:         usage,
+		Model:         originalModel,
+		UpstreamModel: mappedModel,
+		Stream:        true,
+		OpenAIWSMode:  true,
+	}
+	if count := imageCounter.Count(); count > 0 {
+		result.ImageCount = count
+		result.ImageOutputSizes = imageCounter.Sizes()
+	}
+	return result
 }
 
 // WSPayloadShouldBridgeImageGen reports whether a Codex WS turn should be routed through
-// the HTTP image bridge: the turn must carry a user-authored message AND that message must
-// express an image generation/edit intent. It parses the payload exactly once, replacing
-// the former WSPayloadHasInput + IsCodexWSImageIntent two-pass check (an image intent
-// already implies a user message, so the has-input gate was redundant).
+// the HTTP image bridge: the turn must carry a user-authored message whose latest content
+// expresses an image generation/edit intent. It parses the payload exactly once (an image
+// intent already implies a user message, so no separate has-input pass is needed).
 func (s *OpenAIGatewayService) WSPayloadShouldBridgeImageGen(payload []byte) bool {
 	return codexWSUserItemsImageIntent(codexWSCollectUserItems(payload))
-}
-
-// WSPayloadHasInput returns true when the WS payload contains a user-authored
-// input message. Tool-only turns are not user prompts and must not trigger the
-// HTTP image bridge fallback.
-func (s *OpenAIGatewayService) WSPayloadHasInput(payload []byte) bool {
-	input := gjson.GetBytes(payload, "input")
-	if !input.Exists() || !input.IsArray() {
-		return false
-	}
-	for _, item := range input.Array() {
-		if codexWSIsUserItem(item) {
-			return true
-		}
-	}
-	return false
 }
 
 // ApplyCodexImageGenerationBridgeToWSPayload injects the image_generation tool and bridge
@@ -4346,11 +4405,6 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	case AccountTypeOAuth:
 		// OAuth accounts use ChatGPT internal API
 		targetURL = chatgptCodexURL
-		snippet := body
-		if len(snippet) > 500 {
-			snippet = snippet[:500]
-		}
-		logger.LegacyPrintf("service.openai_gateway", "[debug] OAuth HTTP POST body_bytes=%d body_prefix=%s", len(body), string(snippet))
 	case AccountTypeAPIKey:
 		// API Key accounts use Platform API or custom base URL
 		baseURL := account.GetOpenAIBaseURL()

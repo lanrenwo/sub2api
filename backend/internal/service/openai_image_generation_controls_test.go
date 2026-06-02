@@ -268,18 +268,7 @@ func TestOpenAIGatewayService_CodexImageGenerationBridgeOverridePrecedence(t *te
 	}
 }
 
-func TestOpenAIGatewayServiceWSPayloadHasInput_UserMessagesOnly(t *testing.T) {
-	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
-
-	require.False(t, svc.WSPayloadHasInput([]byte(`{"input":[]}`)))
-	require.False(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"function_call_output","call_id":"call_1","output":"missing OPENAI_API_KEY"}]}`)))
-	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"message","role":"user","content":"continue"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)))
-	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"},{"type":"message","role":"user","content":"continue"}]}`)))
-	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"type":"message","role":"user","content":"生成一张奶茶宣传海报"}]}`)))
-	require.True(t, svc.WSPayloadHasInput([]byte(`{"input":[{"role":"user","content":[{"type":"input_text","text":"draw a poster"}]}]}`)))
-}
-
-func TestOpenAIGatewayServiceIsCodexWSImageIntent(t *testing.T) {
+func TestOpenAIGatewayServiceWSPayloadShouldBridgeImageGen(t *testing.T) {
 	svc := newOpenAIImageGenerationControlTestService(&httpUpstreamRecorder{})
 
 	tests := []struct {
@@ -322,13 +311,10 @@ func TestOpenAIGatewayServiceIsCodexWSImageIntent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, svc.IsCodexWSImageIntent([]byte(tt.payload)))
-			// The single-parse bridge gate must stay equivalent to the legacy
-			// has-input AND image-intent two-pass check.
-			require.Equal(t,
-				svc.WSPayloadHasInput([]byte(tt.payload)) && svc.IsCodexWSImageIntent([]byte(tt.payload)),
-				svc.WSPayloadShouldBridgeImageGen([]byte(tt.payload)),
-			)
+			// WSPayloadShouldBridgeImageGen is the production gate: a turn is bridged only
+			// when its latest user message expresses an image generation/edit intent
+			// (tool-only turns and bare follow-up cues without prior image intent excluded).
+			require.Equal(t, tt.want, svc.WSPayloadShouldBridgeImageGen([]byte(tt.payload)))
 		})
 	}
 }
