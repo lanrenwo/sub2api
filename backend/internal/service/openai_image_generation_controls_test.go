@@ -287,6 +287,38 @@ func TestOpenAIGatewayServiceWSPayloadShouldBridgeImageGen(t *testing.T) {
 		{"en edit the photo", `{"input":[{"role":"user","content":[{"type":"input_text","text":"please edit the photo to remove the car"}]}]}`, true},
 		{"input_image edit", `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,xxx"},{"type":"input_text","text":"做成水彩风格"}]}]}`, true},
 
+		// --- previously-missed: loanword nouns in Chinese context ---
+		{"zh draw logo", `{"input":[{"type":"message","role":"user","content":"画个logo"}]}`, true},
+		{"zh make banner", `{"input":[{"type":"message","role":"user","content":"做个banner"}]}`, true},
+		{"zh make meme", `{"input":[{"type":"message","role":"user","content":"生成一张meme图"}]}`, true},
+		{"zh sticker", `{"input":[{"type":"message","role":"user","content":"帮我做几个贴纸"}]}`, true},
+
+		// --- previously-missed: loanword nouns in English context ---
+		{"en create banner", `{"input":[{"role":"user","content":[{"type":"input_text","text":"create a banner for my website"}]}]}`, true},
+		{"en design logo", `{"input":[{"role":"user","content":[{"type":"input_text","text":"design a logo for the app"}]}]}`, true},
+		{"en make thumbnail", `{"input":[{"role":"user","content":[{"type":"input_text","text":"make a thumbnail for the video"}]}]}`, true},
+		{"en generate mockup", `{"input":[{"role":"user","content":[{"type":"input_text","text":"generate a mockup of the landing page"}]}]}`, true},
+		{"en make sticker", `{"input":[{"role":"user","content":[{"type":"input_text","text":"make a sticker of a cute cat"}]}]}`, true},
+
+		// --- previously-missed: zh verb variants (来一张/整一张) ---
+		{"zh lai yi zhang", `{"input":[{"type":"message","role":"user","content":"来一张夕阳海报"}]}`, true},
+		{"zh lai yi ge", `{"input":[{"type":"message","role":"user","content":"来一个卡通头像"}]}`, true},
+		{"zh zheng yi zhang", `{"input":[{"type":"message","role":"user","content":"整一张节日贺卡"}]}`, true},
+
+		// --- previously-missed: zh design verb ---
+		{"zh design poster", `{"input":[{"type":"message","role":"user","content":"设计一张活动海报"}]}`, true},
+		{"zh design cover", `{"input":[{"type":"message","role":"user","content":"帮我设计个封面"}]}`, true},
+
+		// --- previously-missed: zh edit phrases ---
+		{"zh face swap", `{"input":[{"type":"message","role":"user","content":"帮我换个脸"}]}`, true},
+		{"zh image to image", `{"input":[{"type":"message","role":"user","content":"图生图，风格改成油画"}]}`, true},
+		{"zh inpainting", `{"input":[{"type":"message","role":"user","content":"局部重绘一下左边的人物"}]}`, true},
+		{"zh colorize", `{"input":[{"type":"message","role":"user","content":"帮我上色，变成彩色"}]}`, true},
+
+		// --- previously-missed: en background removal ---
+		{"en remove background", `{"input":[{"role":"user","content":[{"type":"input_text","text":"remove the background from this image"}]}]}`, true},
+		{"en transparent background", `{"input":[{"role":"user","content":[{"type":"input_text","text":"make the background transparent"}]}]}`, true},
+
 		// --- should NOT trigger ---
 		{"zh generate chart", `{"input":[{"type":"message","role":"user","content":"生成测试图表数据"}]}`, false},
 		{"zh analyze screenshot", `{"input":[{"type":"message","role":"user","content":"这张图里的代码逻辑怎么改"}]}`, false},
@@ -298,6 +330,12 @@ func TestOpenAIGatewayServiceWSPayloadShouldBridgeImageGen(t *testing.T) {
 		{"json body analysis", `{"input":[{"type":"message","role":"user","content":"这条 JSON body 里的 | ID: 被 cmd_inject 当成 shell 管道了"}]}`, false},
 		{"tool-only turn", `{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`, false},
 		{"empty input", `{"input":[]}`, false},
+		// --- false-positive guards for new additions ---
+		{"en design a button component", `{"input":[{"role":"user","content":[{"type":"input_text","text":"design a button component in React"}]}]}`, false},
+		{"zh design API", `{"input":[{"type":"message","role":"user","content":"设计一个用户认证API"}]}`, false},
+		{"en logo component code", `{"input":[{"role":"user","content":[{"type":"input_text","text":"fix the Logo component import"}]}]}`, false},
+		{"en banner ad code", `{"input":[{"role":"user","content":[{"type":"input_text","text":"hide the banner notification"}]}]}`, false},
+		{"zh sticker code", `{"input":[{"type":"message","role":"user","content":"这个贴纸效果用CSS怎么实现"}]}`, false},
 
 		// --- scope: only the latest user message decides (no follow-up cue) ---
 		{"history image then code turn", `{"input":[{"type":"message","role":"user","content":"生成一张海报"},{"type":"function_call_output","call_id":"c1","output":"done"},{"type":"message","role":"user","content":"现在帮我重构这个函数"}]}`, false},

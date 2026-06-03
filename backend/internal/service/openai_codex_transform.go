@@ -720,15 +720,23 @@ func ensureOpenAIResponsesImageGenerationTool(reqBody map[string]any) bool {
 // (image/render/background/logo/icon) do NOT trigger on their own.
 
 var (
-	reEnImageGenVerb  = regexp.MustCompile(`\b(generate|create|make|draw|paint|render|produce|sketch|design)\b`)
-	reEnImageNoun     = regexp.MustCompile(`\b(image|images|picture|pictures|poster|posters|photo|photos|photograph|photographs|illustration|illustrations|wallpaper|wallpapers|artwork|drawing|drawings|painting|paintings|avatar|avatars|comic|comics)\b`)
-	reEnImagePhrase   = regexp.MustCompile(`\b(an image of|edit(ed|s|ing)?\s+(the\s+|this\s+|that\s+|my\s+|an?\s+)?(image|photo|picture|illustration))\b`)
-	zhImageGenVerbs   = []string{"生成", "画", "绘制", "绘", "做", "制作", "来张", "整张", "生图", "出图"}
-	zhImageNouns      = []string{"图片", "图像", "海报", "头像", "插画", "壁纸", "封面", "漫画", "配图", "照片", "表情包", "立绘"}
-	zhImageEditPhrase = []string{"抠图", "改图", "修图", "重绘", "p图", "P图", "去水印", "加水印", "扩图"}
-	// 跟在“图”后面表示这是“图表/图标”等非图片语义的字符，需排除以避免误触发。
+	reEnImageGenVerb = regexp.MustCompile(`\b(generate|create|make|draw|paint|render|produce|sketch|design)\b`)
+	// reEnImageNoun covers standalone English image-request nouns. Intentionally excludes
+	// "icon" (React/Vue components), "background" (CSS), "cover" (code coverage) to avoid
+	// false positives on coding turns.
+	reEnImageNoun = regexp.MustCompile(`\b(image|images|picture|pictures|poster|posters|photo|photos|photograph|photographs|illustration|illustrations|wallpaper|wallpapers|artwork|drawing|drawings|painting|paintings|avatar|avatars|comic|comics|banner|banners|logo|logos|thumbnail|thumbnails|mockup|mockups|meme|memes|sticker|stickers|portrait|portraits)\b`)
+	reEnImagePhrase = regexp.MustCompile(`\b(an image of|edit(ed|s|ing)?\s+(the\s+|this\s+|that\s+|my\s+|an?\s+)?(image|photo|picture|illustration)|remove (the )?background|without background|transparent background|background transparent)\b`)
+	zhImageGenVerbs = []string{
+		"生成", "画", "绘制", "绘", "做", "制作", "设计",
+		"来张", "来一张", "来一个", "来幅", "来一幅",
+		"整张", "整一张", "整一个",
+		"生图", "出图",
+	}
+	zhImageNouns      = []string{"图片", "图像", "海报", "头像", "插画", "壁纸", "封面", "漫画", "配图", "照片", "表情包", "立绘", "贴纸", "贺卡"}
+	zhImageEditPhrase = []string{"抠图", "改图", "修图", "重绘", "p图", "P图", "去水印", "加水印", "扩图", "换脸", "换个脸", "换张脸", "上色", "图生图", "局部重绘"}
+	// 跟在"图"后面表示这是"图表/图标"等非图片语义的字符，需排除以避免误触发。
 	zhBareImageExcludeNext = map[rune]struct{}{'表': {}, '标': {}, '例': {}, '层': {}, '谱': {}, '文': {}}
-	// 续作线索：省略式追问（“再来一张/another”），需结合同 payload 更早的生图意图才放行。
+	// 续作线索：省略式追问（"再来一张/another"），需结合同 payload 更早的生图意图才放行。
 	zhImageFollowupCues = []string{"再来一张", "再来一个", "再来个", "再来张", "再生成", "再画", "再做一张", "再做个", "再搞一张", "再出一张", "再整一张", "换一张", "换张"}
 	reEnImageFollowup   = regexp.MustCompile(`\b(another( one)?|one more|do another|make another)\b`)
 )
@@ -838,6 +846,12 @@ func matchImageIntentText(text string) bool {
 	if zhHasAny(text, zhImageGenVerbs) && zhHasImageNoun(text) {
 		return true
 	}
+	// Chinese image-request verb + English loanword noun (e.g. "画个logo", "做个banner").
+	// reEnImageNoun already covers the loanwords; the Chinese verb ensures this isn't a
+	// bare coding reference like "update the logo in the header".
+	if zhHasAny(text, zhImageGenVerbs) && reEnImageNoun.MatchString(lower) {
+		return true
+	}
 	return false
 }
 
@@ -850,7 +864,7 @@ func zhHasAny(text string, needles []string) bool {
 	return false
 }
 
-// zhHasImageNoun matches strong pictorial nouns, plus a bare “图” that is not part of
+// zhHasImageNoun matches strong pictorial nouns, plus a bare "图" that is not part of
 // a non-pictorial compound such as 图表/图标/图例/图层/图谱/图文.
 func zhHasImageNoun(text string) bool {
 	if zhHasAny(text, zhImageNouns) {
